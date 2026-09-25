@@ -34,7 +34,8 @@ param(
   [switch]$SkipStart,
   [switch]$MountVhdOnly,
   [switch]$GitSparse,
-  [string]$GitUrl = "https://github.com/TechmarkCo/SuperCloud.git"
+  [string]$GitUrl = "https://github.com/TechmarkCo/supercloud-collector.git",
+  [string]$PackBase = "https://raw.githubusercontent.com/TechmarkCo/supercloud-collector/main"
 )
 
 $ErrorActionPreference = "Stop"
@@ -147,52 +148,67 @@ function Get-CollectorSparseClone {
 }
 
 function Get-CollectorOnlyPack {
-  Write-Step "Download collector files only from $Master (no console)"
+  Write-Step "Download collector files only (no console)"
   $pack = Join-Path $WorkRoot "collector-only"
   if (Test-Path $pack) { Remove-Item -Recurse -Force $pack }
   New-Item -ItemType Directory -Force -Path $pack | Out-Null
 
+  $bases = @(
+    $PackBase.TrimEnd("/"),
+    "$Master/collector",
+    "https://raw.githubusercontent.com/TechmarkCo/supercloud-collector/main"
+  ) | Select-Object -Unique
+
   $archive = Join-Path $WorkRoot "appliance-pack.tar.gz"
-  foreach ($u in @("$Master/collector/appliance-pack.tar.gz", "$Master/collector/pack.tar.gz")) {
-    try {
-      Get-RemoteFile -Uri $u -OutFile $archive | Out-Null
-      $extract = Join-Path $WorkRoot "pack-extract"
-      if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
-      New-Item -ItemType Directory -Force -Path $extract | Out-Null
-      Push-Location $extract
-      try { & tar -xf $archive } finally { Pop-Location }
-      if (Test-ConsoleTree $extract) {
-        return (Copy-CollectorSlice $extract)
+  foreach ($base in $bases) {
+    foreach ($name in @("appliance-pack.tar.gz", "pack.tar.gz")) {
+      try {
+        Get-RemoteFile -Uri "$base/$name" -OutFile $archive | Out-Null
+        $extract = Join-Path $WorkRoot "pack-extract"
+        if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
+        New-Item -ItemType Directory -Force -Path $extract | Out-Null
+        Push-Location $extract
+        try { & tar -xf $archive } finally { Pop-Location }
+        if (Test-ConsoleTree $extract) { return (Copy-CollectorSlice $extract) }
+        if ((Test-Path (Join-Path $extract "collector")) -or (Test-Path (Join-Path $extract "public\collector"))) {
+          return $extract
+        }
+        return $extract
+      } catch {
+        Write-Host "No pack at $base/$name"
       }
-      if (Test-Path (Join-Path $extract "collector")) { return $extract }
-      if (Test-Path (Join-Path $extract "public\collector")) { return $extract }
-    } catch {
-      Write-Host "No pack at $u"
     }
   }
 
-  $files = @(
-    @{ Uri = "$Master/collector/install.sh"; Rel = "public\collector\install.sh" },
-    @{ Uri = "$Master/collector/install.ps1"; Rel = "public\collector\install.ps1" },
-    @{ Uri = "$Master/collector/bastion-collector.mjs"; Rel = "public\collector\bastion-collector.mjs" },
-    @{ Uri = "$Master/collector/start-collector.sh"; Rel = "public\collector\start-collector.sh" },
-    @{ Uri = "$Master/collector/start-collector.ps1"; Rel = "public\collector\start-collector.ps1" },
-    @{ Uri = "$Master/collector/collector.config.example.json"; Rel = "public\collector\collector.config.example.json" },
-    @{ Uri = "$Master/collector/cloud-init.yaml"; Rel = "collector\appliance\cloud-init.yaml" },
-    @{ Uri = "$Master/collector/network-config.yaml"; Rel = "collector\appliance\network-config.yaml" },
-    @{ Uri = "$Master/collector/firstboot.sh"; Rel = "collector\appliance\firstboot.sh" }
+  $relMap = @(
+    @{ Rel = "public\collector\install.sh"; Names = @("install.sh", "public/collector/install.sh") },
+    @{ Rel = "public\collector\install.ps1"; Names = @("install.ps1", "public/collector/install.ps1") },
+    @{ Rel = "public\collector\bastion-collector.mjs"; Names = @("bastion-collector.mjs") },
+    @{ Rel = "public\collector\start-collector.sh"; Names = @("start-collector.sh") },
+    @{ Rel = "public\collector\start-collector.ps1"; Names = @("start-collector.ps1") },
+    @{ Rel = "public\collector\collector.config.example.json"; Names = @("collector.config.example.json") },
+    @{ Rel = "collector\appliance\cloud-init.yaml"; Names = @("cloud-init.yaml") },
+    @{ Rel = "collector\appliance\network-config.yaml"; Names = @("network-config.yaml") },
+    @{ Rel = "collector\appliance\firstboot.sh"; Names = @("firstboot.sh") }
   )
   $ok = 0
-  foreach ($f in $files) {
-    try {
-      Get-RemoteFile -Uri $f.Uri -OutFile (Join-Path $pack $f.Rel) | Out-Null
-      $ok++
-    } catch {
-      Write-Host "Skip $($f.Uri)"
+  foreach ($item in $relMap) {
+    $got = $false
+    foreach ($base in $bases) {
+      if ($got) { break }
+      foreach ($name in $item.Names) {
+        try {
+          Get-RemoteFile -Uri "$base/$name" -OutFile (Join-Path $pack $item.Rel) | Out-Null
+          $ok++
+          $got = $true
+          break
+        } catch { }
+      }
     }
+    if (-not $got) { Write-Host "Skip $($item.Rel)" }
   }
   if ($ok -lt 1) {
-    throw "Could not download collector files from $Master/collector/. This host must not clone the full SuperCloud repo."
+    throw "Could not download collector files. Tried $([string]::Join(', ', $bases)). Do not clone the SuperCloud console repo."
   }
   return $pack
 }
@@ -411,16 +427,24 @@ function New-CollectorSeedIso {
   # Fetch the Linux installer with PowerShell on this host. The guest then runs
   # the copy from the CIDATA ISO and never needs curl.
   $guestInstall = Join-Path $seed "install.sh"
-  try {
-    Get-RemoteFile -Uri "$Master/collector/install.sh" -OutFile $guestInstall | Out-Null
-  } catch {
-    Write-Host "Console install.sh not reachable ($($_.Exception.Message))."
+  $installTried = @(
+    "$PackBase/install.sh",
+    "$Master/collector/install.sh",
+    "https://raw.githubusercontent.com/TechmarkCo/supercloud-collector/main/install.sh"
+  )
+  $gotInstall = $false
+  foreach ($u in $installTried) {
+    try {
+      Get-RemoteFile -Uri $u -OutFile $guestInstall | Out-Null
+      $gotInstall = $true
+      break
+    } catch { Write-Host "install.sh not at $u" }
+  }
+  if (-not $gotInstall) {
     if ($PackRoot -and (Test-Path (Join-Path $PackRoot "public\collector\install.sh"))) {
       Copy-Item (Join-Path $PackRoot "public\collector\install.sh") $guestInstall -Force
-      Write-Host "Using install.sh from the appliance pack."
     } elseif ($PackRoot -and (Test-Path (Join-Path $PackRoot "collector\install\install-linux.sh"))) {
       Copy-Item (Join-Path $PackRoot "collector\install\install-linux.sh") $guestInstall -Force
-      Write-Host "Using install-linux.sh from the appliance pack."
     } else {
       Write-Host "Seed ISO will not contain install.sh. Set it after first boot."
     }
