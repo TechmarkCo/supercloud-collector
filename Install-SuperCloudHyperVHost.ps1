@@ -548,16 +548,54 @@ function Get-UbuntuAzureVhd {
     Write-Host "Reusing $vhd"
     return $vhd
   }
-  $url = "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64-azure.vhd.zip"
-  $zip = Join-Path $imgDir "jammy-azure.vhd.zip"
-  Write-Step "Download Ubuntu 22.04 Azure VHD (Hyper-V compatible)"
-  Get-RemoteFile -Uri $url -OutFile $zip | Out-Null
-  Write-Host "Unpacking VHD..."
-  Expand-Archive -Path $zip -DestinationPath $imgDir -Force
-  $found = Get-ChildItem $imgDir -Recurse -Filter "*.vhd" | Select-Object -First 1
-  if (-not $found) { throw "Ubuntu zip did not contain a .vhd" }
-  if ($found.FullName -ne $vhd) { Copy-Item $found.FullName $vhd -Force }
-  return $vhd
+  $existing = Get-ChildItem $imgDir -Recurse -Include *.vhd,*.vhdx -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($existing) {
+    Write-Host "Reusing $($existing.FullName)"
+    return $existing.FullName
+  }
+
+  $urls = @(
+    "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64-azure.vhd.tar.gz",
+    "https://cloud-images.ubuntu.com/releases/jammy/release/jammy-server-cloudimg-amd64-azure.vhd.tar.gz",
+    "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64-azure.vhd.tar.gz"
+  )
+  Write-Step "Download Ubuntu Azure VHD for Hyper-V (~700 MB .tar.gz, not the old .zip)"
+  $archive = $null
+  foreach ($url in $urls) {
+    $dest = Join-Path $imgDir ([IO.Path]::GetFileName($url))
+    try {
+      Write-Host "GET $url"
+      if (Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue) {
+        Start-BitsTransfer -Source $url -Destination $dest -ErrorAction Stop
+      } else {
+        $old = $ProgressPreference
+        $ProgressPreference = "Continue"
+        try { Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing } finally { $ProgressPreference = $old }
+      }
+      if ((Test-Path $dest) -and (Get-Item $dest).Length -gt 1MB) {
+        $archive = $dest
+        break
+      }
+    } catch {
+      Write-Host "Missed $url ($($_.Exception.Message))"
+    }
+  }
+  if (-not $archive) {
+    throw "Could not download an Ubuntu Azure VHD. Pass -VhdPath to an existing .vhd/.vhdx."
+  }
+  Write-Host "Unpacking $archive ..."
+  if (-not (Get-Command tar -ErrorAction SilentlyContinue)) {
+    throw "tar.exe is required to unpack $($archive). It ships with Windows Server 2019+."
+  }
+  Push-Location $imgDir
+  try { & tar -xf $archive } finally { Pop-Location }
+  $found = Get-ChildItem $imgDir -Recurse -Include *.vhd,*.vhdx -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $found) { throw "Archive unpacked but no .vhd/.vhdx was inside: $archive" }
+  if ($found.FullName -ne $vhd) {
+    Copy-Item $found.FullName $vhd -Force
+    return $vhd
+  }
+  return $found.FullName
 }
 
 function Copy-DifferencingDisk([string]$BaseVhd) {
