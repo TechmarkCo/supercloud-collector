@@ -1,0 +1,18 @@
+{
+  "siteId": "bkk",
+  "hostname": "COLLECTOR-BKK",
+  "hubUrl": "https://supercloud.techmarkcompany.com/collector/v1",
+  "token": "",
+  "inventoryPath": "./inventory.yaml",
+  "pollSeconds": 20,
+  "autoUpgrade": true,
+  "honeypot": {
+    "enabled": true,
+    "bind": "0.0.0.0",
+    "services": [
+      { "name": "SSH", "port": 2222, "banner": "SSH-2.0-OpenSSH_8.4" },
+      { "name": "HTTP", "port": 8088 },
+      { "name": "SMB", "port": 4450 }
+    ]
+  }
+}

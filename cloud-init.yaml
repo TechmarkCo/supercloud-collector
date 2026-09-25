@@ -1,0 +1,25 @@
+#cloud-config
+hostname: supercloud-collector
+manage_etc_hosts: true
+timezone: Asia/Bangkok
+
+package_update: true
+packages:
+  - ca-certificates
+  - curl
+  - openssh-client
+
+write_files:
+  - path: /etc/supercloud.env
+    permissions: "0600"
+    content: |
+      SUPERCLOUD_MASTER=https://supercloud.techmarkcompany.com
+      SUPERCLOUD_SITE=${SUPERCLOUD_SITE}
+      SUPERCLOUD_TOKEN=${SUPERCLOUD_TOKEN}
+
+runcmd:
+  - dhclient -v || true
+  - . /etc/supercloud.env
+  - curl -fsSL https://supercloud.techmarkcompany.com/collector/install.sh | sh -s -- --site "$SUPERCLOUD_SITE" --token "$SUPERCLOUD_TOKEN"
+
+final_message: "SuperCloud collector is up. DHCP lease on the LAN, master is supercloud.techmarkcompany.com"
