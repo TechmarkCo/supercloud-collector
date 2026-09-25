@@ -391,6 +391,40 @@ function Find-PackRoot([string]$Root) {
   return $Root
 }
 
+function New-CidataVhd {
+  param(
+    [Parameter(Mandatory)][string]$SeedDir,
+    [Parameter(Mandatory)][string]$VhdPath
+  )
+  $VhdPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($VhdPath)
+  if (Test-Path $VhdPath) {
+    Dismount-VHD -Path $VhdPath -ErrorAction SilentlyContinue
+    Remove-Item -Force $VhdPath
+  }
+  Write-Host "Building CIDATA seed disk $VhdPath (FAT32). IMAPI ISO burner is not required."
+  New-VHD -Path $VhdPath -SizeBytes 64MB -Dynamic | Out-Null
+  $disk = Mount-VHD -Path $VhdPath -Passthru | Get-Disk
+  if ($disk.PartitionStyle -eq "RAW") {
+    Initialize-Disk -Number $disk.Number -PartitionStyle MBR -PassThru | Out-Null
+  }
+  $part = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue |
+    Where-Object { $_.Type -ne "Reserved" -and $_.Size -gt 1MB } |
+    Select-Object -First 1
+  if (-not $part) {
+    $part = New-Partition -DiskNumber $disk.Number -UseMaximumSize -AssignDriveLetter -IsActive
+  } elseif (-not $part.DriveLetter) {
+    $part = Add-PartitionAccessPath -DiskNumber $disk.Number -PartitionNumber $part.PartitionNumber -AssignDriveLetter -PassThru
+    $part = Get-Partition -DiskNumber $disk.Number -PartitionNumber $part.PartitionNumber
+  }
+  Format-Volume -Partition $part -FileSystem FAT32 -NewFileSystemLabel "CIDATA" -Confirm:$false | Out-Null
+  $letter = (Get-Partition -DiskNumber $disk.Number -PartitionNumber $part.PartitionNumber).DriveLetter
+  if (-not $letter) { throw "CIDATA VHD mounted but no drive letter was assigned." }
+  $dest = "${letter}:\"
+  Copy-Item (Join-Path $SeedDir "*") $dest -Force
+  Dismount-VHD -Path $VhdPath
+  return $VhdPath
+}
+
 function New-CidataIso {
   param(
     [Parameter(Mandatory)][string]$SeedDir,
@@ -401,7 +435,7 @@ function New-CidataIso {
   if (Test-Path $IsoPath) { Remove-Item -Force $IsoPath }
 
   $oscdimg = @(
-    "$env:ProgramFiles(x86)\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\Oscdimg\oscdimg.exe",
+    "${env:ProgramFiles(x86)}\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\Oscdimg\oscdimg.exe",
     "$env:ProgramFiles\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools\amd64\Oscdimg\oscdimg.exe"
   ) | Where-Object { Test-Path $_ } | Select-Object -First 1
   if ($oscdimg) {
@@ -409,7 +443,8 @@ function New-CidataIso {
     if (Test-Path $IsoPath) { return $IsoPath }
   }
 
-  Add-Type -TypeDefinition @"
+  try {
+    Add-Type -TypeDefinition @"
 using System;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -431,17 +466,20 @@ public static class ScIsoWriter {
     }
   }
 }
-"@ -ErrorAction SilentlyContinue
-
-  $fsi = New-Object -ComObject IMAPI2FS.MsftFileSystemImage
-  $fsi.VolumeName = "CIDATA"
-  $fsi.FileSystemsToCreate = 3
-  $fsi.FreeMediaBlocks = 0
-  $null = $fsi.Root.AddTree($SeedDir, $false)
-  $result = $fsi.CreateResultImage()
-  [ScIsoWriter]::Write($result.ImageStream, $IsoPath)
-  if (-not (Test-Path $IsoPath)) { throw "Failed to build CIDATA ISO at $IsoPath" }
-  return $IsoPath
+"@ -ErrorAction Stop
+    $fsi = New-Object -ComObject IMAPI2FS.MsftFileSystemImage
+    $fsi.VolumeName = "CIDATA"
+    $fsi.FileSystemsToCreate = 3
+    $fsi.FreeMediaBlocks = 0
+    $null = $fsi.Root.AddTree($SeedDir, $false)
+    $result = $fsi.CreateResultImage()
+    [ScIsoWriter]::Write($result.ImageStream, $IsoPath)
+    if (Test-Path $IsoPath) { return $IsoPath }
+  } catch {
+    Write-Host "ISO burner COM (IMAPI2) is not available on this Server SKU. Using a FAT32 CIDATA disk instead."
+  }
+  $vhd = Join-Path $WorkRoot "cidata.vhdx"
+  return (New-CidataVhd -SeedDir $SeedDir -VhdPath $vhd)
 }
 
 function New-CollectorSeedIso {
@@ -502,7 +540,7 @@ runcmd:
   - dhclient -v || true
   - . /etc/supercloud.env
   - mkdir -p /mnt/cidata
-  - mount /dev/sr0 /mnt/cidata 2>/dev/null || mount /dev/cdrom /mnt/cidata 2>/dev/null || true
+  - mount LABEL=CIDATA /mnt/cidata 2>/dev/null || mount /dev/sr0 /mnt/cidata 2>/dev/null || mount /dev/cdrom /mnt/cidata 2>/dev/null || true
   - |
       if [ -z "`$SUPERCLOUD_TOKEN" ]; then
         echo "Token empty. Edit /etc/supercloud.env and re-run /mnt/cidata/install.sh" >&2
@@ -648,11 +686,15 @@ function New-CollectorVm {
   Set-VMProcessor -VMName $VmName -Count $ProcessorCount
   if ($Generation -eq 2) {
     Set-VMFirmware -VMName $VmName -EnableSecureBoot On -SecureBootTemplate MicrosoftUEFICertificateAuthority
-    if ($SeedIso) { Add-VMDvdDrive -VMName $VmName -Path $SeedIso }
+    if ($SeedIso -and $SeedIso -match '\.iso$') { Add-VMDvdDrive -VMName $VmName -Path $SeedIso }
     if ($InstallIso) { Add-VMDvdDrive -VMName $VmName -Path $InstallIso }
   } else {
-    if ($SeedIso) { Set-VMDvdDrive -VMName $VmName -Path $SeedIso }
+    if ($SeedIso -and $SeedIso -match '\.iso$') { Set-VMDvdDrive -VMName $VmName -Path $SeedIso }
     elseif ($InstallIso) { Set-VMDvdDrive -VMName $VmName -Path $InstallIso }
+  }
+  if ($SeedIso -and $SeedIso -match '\.vhd') {
+    Add-VMHardDiskDrive -VMName $VmName -Path $SeedIso
+    Write-Host "Attached CIDATA seed disk $SeedIso"
   }
   $nic = Get-VMNetworkAdapter -VMName $VmName
   Write-Host ("NIC MAC {0} on switch {1}" -f $nic.MacAddress, $SwitchName)
@@ -757,6 +799,11 @@ if (-not $diskForVm) {
 }
 
 $diskForVm = (Resolve-Path $diskForVm).Path
+$existingVm = Get-VM -Name $VmName -ErrorAction SilentlyContinue
+if ($existingVm) {
+  if ($existingVm.State -ne "Off") { Stop-VM -Name $VmName -TurnOff -Force }
+  Remove-VM -Name $VmName -Force
+}
 if ($Token) {
   $seedIso = New-CollectorSeedIso -PackRoot $packRoot -SiteId $Site -HubToken $Token
 } else {
