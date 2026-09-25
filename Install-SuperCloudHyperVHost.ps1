@@ -219,15 +219,21 @@ function Get-ScriptRoot {
 }
 
 function Test-HyperVPresent {
-  try {
-    $f = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction Stop
-    return $f.State -eq "Enabled"
-  } catch {
+  # Server Hyper-V hosts already have Get-VM. Client SKUs use Microsoft-Hyper-V-All.
+  if (Get-Command Get-VM -ErrorAction SilentlyContinue) { return $true }
+  if (Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) {
     try {
-      Get-Command Get-VM -ErrorAction Stop | Out-Null
-      return $true
-    } catch { return $false }
+      $wf = Get-WindowsFeature -Name Hyper-V -ErrorAction Stop
+      if ($wf -and $wf.Installed) { return $true }
+    } catch { }
   }
+  foreach ($name in @("Microsoft-Hyper-V", "Microsoft-Hyper-V-All")) {
+    try {
+      $f = Get-WindowsOptionalFeature -Online -FeatureName $name -ErrorAction Stop
+      if ($f.State -eq "Enabled") { return $true }
+    } catch { }
+  }
+  return $false
 }
 
 function Enable-HyperVRole {
@@ -237,12 +243,36 @@ function Enable-HyperVRole {
     return $false
   }
   $restart = $false
-  if (Get-Command Enable-WindowsOptionalFeature -ErrorAction SilentlyContinue) {
-    $r = Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -All -NoRestart
-    if ($r.RestartNeeded) { $restart = $true }
-  } else {
+  $os = $null
+  try { $os = Get-CimInstance Win32_OperatingSystem } catch { }
+  $isServer = $os -and ($os.ProductType -ne 1)
+  Write-Host $("OS={0} ProductType={1} (1=client, 2/3=server)" -f $os.Caption, $os.ProductType)
+
+  if ($isServer -and (Get-Command Install-WindowsFeature -ErrorAction SilentlyContinue)) {
+    Write-Host "Windows Server: Install-WindowsFeature Hyper-V"
     $r = Install-WindowsFeature -Name Hyper-V -IncludeManagementTools -Restart:$false
     if ($r.RestartNeeded) { $restart = $true }
+  } else {
+    $enabled = $false
+    foreach ($name in @("Microsoft-Hyper-V", "Microsoft-Hyper-V-All")) {
+      try {
+        Write-Host "Trying optional feature $name"
+        $r = Enable-WindowsOptionalFeature -Online -FeatureName $name -All -NoRestart
+        $enabled = $true
+        if ($r.RestartNeeded) { $restart = $true }
+        break
+      } catch {
+        Write-Host "$name not available ($($_.Exception.Message))"
+      }
+    }
+    if (-not $enabled) {
+      if (Get-Command Install-WindowsFeature -ErrorAction SilentlyContinue) {
+        $r = Install-WindowsFeature -Name Hyper-V -IncludeManagementTools -Restart:$false
+        if ($r.RestartNeeded) { $restart = $true }
+      } else {
+        throw "Could not enable Hyper-V. On Server use: Install-WindowsFeature Hyper-V -IncludeManagementTools"
+      }
+    }
   }
   if ($restart) {
     Write-Host "Hyper-V is installed but a reboot is required."
