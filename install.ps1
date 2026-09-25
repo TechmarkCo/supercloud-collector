@@ -2,9 +2,11 @@ param(
   [string]$Site = $env:SUPERCLOUD_SITE,
   [string]$Token = $(if ($env:SUPERCLOUD_TOKEN) { $env:SUPERCLOUD_TOKEN } else { $env:BASTION_TOKEN }),
   [string]$Master = $(if ($env:SUPERCLOUD_MASTER) { $env:SUPERCLOUD_MASTER } else { "https://supercloud.techmarkcompany.com" }),
-  [string]$Hub = $(if ($env:SUPERCLOUD_HUB) { $env:SUPERCLOUD_HUB } else { "" })
+  [string]$Hub = $(if ($env:SUPERCLOUD_HUB) { $env:SUPERCLOUD_HUB } else { "" }),
+  [string]$PackBase = $(if ($env:SUPERCLOUD_PACK) { $env:SUPERCLOUD_PACK } else { "https://raw.githubusercontent.com/TechmarkCo/supercloud-collector/main" })
 )
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 if (-not $Hub) { $Hub = "$Master/collector/v1" }
 if (-not $Site -or -not $Token) {
@@ -13,10 +15,39 @@ if (-not $Site -or -not $Token) {
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
   Write-Error "Install Node.js LTS from https://nodejs.org then re-run."
 }
+
+function Get-CollectorFile {
+  param([string]$Name, [string]$OutFile, [switch]$Optional)
+  $uris = @(
+    "$($PackBase.TrimEnd('/'))/$Name",
+    "https://raw.githubusercontent.com/TechmarkCo/supercloud-collector/main/$Name",
+    "$Master/collector/$Name"
+  ) | Select-Object -Unique
+  foreach ($uri in $uris) {
+    Write-Host "GET $uri"
+    try {
+      Invoke-WebRequest -UseBasicParsing -Uri $uri -OutFile $OutFile
+      if ((Test-Path $OutFile) -and (Get-Item $OutFile).Length -gt 0) { return }
+    } catch {
+      Write-Host "Not at $uri"
+    }
+  }
+  if ($Optional) { return }
+  throw "Could not download $Name. Console /collector/ is 404; use PackBase $PackBase"
+}
+
 $Dest = "C:\Bastion"
 New-Item -ItemType Directory -Force -Path $Dest | Out-Null
-Invoke-WebRequest -UseBasicParsing "$Master/collector/bastion-collector.mjs" -OutFile "$Dest\bastion-collector.mjs"
-try { Invoke-WebRequest -UseBasicParsing "$Master/collector/start-collector.ps1" -OutFile "$Dest\start-collector.ps1" } catch {}
+Get-CollectorFile -Name "bastion-collector.mjs" -OutFile "$Dest\bastion-collector.mjs"
+try { Get-CollectorFile -Name "start-collector.ps1" -OutFile "$Dest\start-collector.ps1" } catch {}
+if (-not (Test-Path "$Dest\start-collector.ps1")) {
+  @'
+$ErrorActionPreference = "Stop"
+Set-Location -Path $PSScriptRoot
+if (-not (Get-Command node -ErrorAction SilentlyContinue)) { throw "Install Node.js LTS" }
+node .\bastion-collector.mjs @args
+'@ | Set-Content "$Dest\start-collector.ps1" -Encoding ascii
+}
 $config = Join-Path $Dest "collector.config.json"
 if (-not (Test-Path $config)) {
   $hostName = "COLLECTOR-" + $Site.ToUpper()
